@@ -24,6 +24,7 @@ bridge_sampler(samples, ...)
   maxiter = 1000,
   silent = FALSE,
   verbose = FALSE,
+  proposal_fit = c("sample", "hybrid"),
   ...
 )
 
@@ -37,6 +38,7 @@ bridge_sampler(samples, ...)
   maxiter = 1000,
   silent = FALSE,
   verbose = FALSE,
+  proposal_fit = c("sample", "hybrid"),
   ...
 )
 
@@ -58,7 +60,8 @@ bridge_sampler(samples, ...)
   rcppFile = NULL,
   maxiter = 1000,
   silent = FALSE,
-  verbose = FALSE
+  verbose = FALSE,
+  proposal_fit = c("sample", "hybrid")
 )
 
 \method{bridge_sampler}{mcmc}(
@@ -79,7 +82,8 @@ bridge_sampler(samples, ...)
   maxiter = 1000,
   param_types = rep("real", ncol(samples)),
   silent = FALSE,
-  verbose = FALSE
+  verbose = FALSE,
+  proposal_fit = c("sample", "hybrid")
 )
 
 \method{bridge_sampler}{matrix}(
@@ -100,7 +104,9 @@ bridge_sampler(samples, ...)
   maxiter = 1000,
   param_types = rep("real", ncol(samples)),
   silent = FALSE,
-  verbose = FALSE
+  verbose = FALSE,
+  gradients = NULL,
+  proposal_fit = c("sample", "hybrid")
 )
 
 \method{bridge_sampler}{stanreg}(
@@ -112,6 +118,7 @@ bridge_sampler(samples, ...)
   maxiter = 1000,
   silent = FALSE,
   verbose = FALSE,
+  proposal_fit = c("sample", "hybrid"),
   ...
 )
 
@@ -132,7 +139,8 @@ bridge_sampler(samples, ...)
   rcppFile = NULL,
   maxiter = 1000,
   silent = FALSE,
-  verbose = FALSE
+  verbose = FALSE,
+  proposal_fit = c("sample", "hybrid")
 )
 
 \method{bridge_sampler}{runjags}(
@@ -152,7 +160,8 @@ bridge_sampler(samples, ...)
   rcppFile = NULL,
   maxiter = 1000,
   silent = FALSE,
-  verbose = FALSE
+  verbose = FALSE,
+  proposal_fit = c("sample", "hybrid")
 )
 
 \method{bridge_sampler}{MCMC_refClass}(
@@ -164,6 +173,7 @@ bridge_sampler(samples, ...)
   maxiter = 1000,
   silent = FALSE,
   verbose = FALSE,
+  proposal_fit = c("sample", "hybrid"),
   ...
 )
 }
@@ -205,6 +215,22 @@ iterations of the updating scheme to the console. Default is FALSE.}
 
 \item{verbose}{Boolean. Should internal debug information be printed to
 console? Default is \code{FALSE}.}
+
+\item{proposal_fit}{Character string giving the estimator used to fit the
+multivariate normal proposal covariance. Either \code{"sample"} (default,
+the sample covariance \eqn{\hat\Sigma_n} of \code{samples}) or
+\code{"hybrid"} (the matrix geometric mean
+\eqn{\hat\Sigma_n \# \hat\Sigma_{\mathrm{score}}} of the sample
+covariance and the inverse empirical Fisher information matrix
+computed from posterior gradients (Seyboldt et al., 2026).
+\code{"hybrid"} requires posterior gradients, which are computed
+automatically for \code{stanfit} and \code{CmdStanMCMC} inputs
+(via \code{rstan::grad_log_prob} and \code{cmdstanr}'s
+\code{grad_log_prob}, respectively), and may be supplied directly
+to \code{bridge_sampler.matrix} via the \code{gradients} argument.
+On other input classes \code{"hybrid"} silently falls back to
+\code{"sample"}. \code{method = "warp3"} ignores
+\code{proposal_fit}.}
 
 \item{stanfit_model}{for the \code{stanfit} method, an additional object of
 class \code{"stanfit"} with the same model as \code{samples}, which will be
@@ -256,6 +282,12 @@ will be exported to the nodes). Default is \code{\link{.GlobalEnv}}.}
 \item{rcppFile}{in case \code{cores > 1} and \code{log_posterior} is an
 \code{Rcpp} function, \code{rcppFile} specifies the path to the cpp file
 (will be compiled on all cores).}
+
+\item{gradients}{(\code{bridge_sampler.matrix} only.) Optional numeric
+matrix of posterior gradients on the unconstrained scale, with one row
+per row of \code{samples}. Consumed only when \code{proposal_fit =
+"hybrid"} and every parameter is unbounded (i.e., \code{lb} and \code{ub}
+are infinite for all parameters). Ignored otherwise.}
 }
 \value{
 If \code{repetitions = 1}, returns a list of class \code{"bridge"}
@@ -302,6 +334,32 @@ Bridge sampling is implemented as described in Meng and Wong (1996,
  (Meng & Schilling, 2002) so that it has the same mean vector, covariance
  matrix, and skew as the samples. \code{method = "warp3"} takes approximately
  twice as long as \code{method = "normal"}.
+
+ When \code{proposal_fit = "hybrid"} (default \code{"sample"}), the
+ proposal covariance for \code{method = "normal"} is replaced by the
+ matrix geometric mean
+ \eqn{\hat\Sigma_n \# \hat\Sigma_{\mathrm{score}} =
+   \hat\Sigma_n^{1/2}
+   (\hat\Sigma_n^{-1/2} \hat\Sigma_{\mathrm{score}}
+    \hat\Sigma_n^{-1/2})^{1/2} \hat\Sigma_n^{1/2}}
+ of the sample covariance \eqn{\hat\Sigma_n} of \code{samples} and
+ \eqn{\hat\Sigma_{\mathrm{score}} = \hat I^{-1}}, the inverse of
+ the empirical centered second moment of the per-draw scores
+ \eqn{s_i = \nabla \log \tilde\pi(\theta_i)},
+ \eqn{\hat I = n^{-1} \sum_{i=1}^n
+  (s_i - \bar s)(s_i - \bar s)^\top}. This provides typically a
+ better proposal than \eqn{\hat\Sigma_n} alone when the
+ sample covariance is poorly conditioned. Posterior gradients are computed
+ automatically for \code{stanfit} and \code{CmdStanMCMC} inputs.
+ \code{method = "warp3"} ignores \code{proposal_fit}, since the
+ warp-III proposal uses an affine-transform standard-normal
+ proposal incompatible with a learned covariance.
+ Inputs to the geometric mean are nearPD-corrected by the bridge
+ sampler before being passed to
+ \code{.geometric_mean_psd()}, and exactly-zero eigenvalues are
+ handled via a pseudo-inverse guard. An un-recoverable input
+ (eigendecomposition failure or non-finite entries in the output)
+ errors explicitly.
 
  Note that for the \code{matrix} method, the lower and upper bound of a
  parameter cannot be a function of the bounds of another parameter.
@@ -586,9 +644,12 @@ Gronau, Q. F., Singmann, H., & Wagenmakers, E.-J. (2020). bridgesampling: An
  Computational and Graphical Statistics, 11(3)}, 552-586.
  \doi{10.1198/106186002457}
 
- Micaletto, G., & Vehtari, A. (2025). Monte Carlo standard errors for bridge
- sampling marginal likelihood estimation. \emph{arXiv preprint},
- arXiv:2508.14487. \url{https://arxiv.org/abs/2508.14487}
+ Micaletto, G., & Vehtari, A. (2025). Bridge Sampling Diagnostics.
+ \emph{arXiv preprint}, arXiv:2508.14487. \url{https://arxiv.org/abs/2508.14487}
+
+ Seyboldt, A., Carlson, E. L., & Carpenter, B. (2026). Preconditioning
+ Hamiltonian Monte Carlo by minimizing Fisher Divergence. \emph{arXiv
+ preprint}, arXiv:2603.18845. \url{https://arxiv.org/abs/2603.18845}
 
  Overstall, A. M., & Forster, J. J. (2010). Default Bayesian model
  determination methods for generalised linear mixed models.

@@ -243,6 +243,71 @@
   out
 }
 
+# Empirical inverse Fisher information estimator of the proposal
+# covariance.
+#
+# Given an n x p matrix of unconstrained-scale gradients
+#   s_i = grad log tilde_pi(theta_i),
+# the empirical CENTERED second moment
+#   Prec_score = (1/n) sum (s_i - bar s)(s_i - bar s)^T
+# consistently estimates the Fisher information matrix under pi,
+# I(pi) = E_pi[s s^T] = -E_pi[grad^2 log pi]  (by integration by
+# parts). E_pi[s] = 0 under regularity, so centered and uncentered
+# plug-ins are asymptotically equivalent; we center to remove the
+# rank-1 (bar s)(bar s)^T finite-sample bias. For a Gaussian target
+# pi = N(mu, Sigma) we have I(pi) = Sigma^{-1}, so
+# Sigma_score = Prec_score^{-1} consistently estimates Sigma in the
+# Gaussian limit. The empirical plug-in is PSD-corrected via
+# Matrix::nearPD and inverted via chol2inv(chol(.)). Used as one
+# input to the matrix geometric mean combiner .geometric_mean_psd().
+#
+# Returns:
+#   list(Sigma_score = <p x p matrix>, ok = TRUE) on success.
+#   list(ok = FALSE, reason = <character>) on rank deficiency, NaN
+#   gradients, dim mismatch, or chol failure.
+.score_covariance <- function(gradients, n_samples = nrow(gradients)) {
+  if (is.null(gradients) || !is.matrix(gradients)) {
+    return(list(ok = FALSE, reason = "gradients is not a matrix"))
+  }
+  p <- ncol(gradients)
+  finite_rows <- stats::complete.cases(gradients) &
+    apply(is.finite(gradients), 1, all)
+  n_finite <- sum(finite_rows)
+  if (n_finite < p + 1L) {
+    return(list(
+      ok = FALSE,
+      reason = sprintf(
+        "only %d of %d gradient rows finite (need > ncol = %d)",
+        n_finite,
+        nrow(gradients),
+        p
+      )
+    ))
+  }
+  G_raw <- gradients[finite_rows, , drop = FALSE]
+  # Centre the scores: removes the rank-1 (bar s)(bar s)^T finite-
+  # sample bias under E_pi[s] = 0.
+  G <- sweep(G_raw, 2L, colMeans(G_raw), check.margin = FALSE)
+  Prec_score <- crossprod(G) / nrow(G)
+  Prec_score <- tryCatch(
+    as.matrix(Matrix::nearPD(Prec_score)$mat),
+    error = function(e) NULL
+  )
+  if (is.null(Prec_score)) {
+    return(list(ok = FALSE, reason = "nearPD on score precision failed"))
+  }
+  Sigma_score <- tryCatch(
+    chol2inv(chol(Prec_score)),
+    error = function(e) {
+      tryCatch(solve(Prec_score), error = function(e2) NULL)
+    }
+  )
+  if (is.null(Sigma_score)) {
+    return(list(ok = FALSE, reason = "score precision could not be inverted"))
+  }
+  list(Sigma_score = Sigma_score, ok = TRUE)
+}
+
 .run.iterative.scheme <- function(
   q11,
   q12,

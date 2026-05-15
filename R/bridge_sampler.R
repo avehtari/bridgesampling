@@ -71,6 +71,26 @@
 #'  iterations of the updating scheme to the console. Default is FALSE.
 #'@param verbose Boolean. Should internal debug information be printed to
 #'  console? Default is \code{FALSE}.
+#'@param proposal_fit Character string giving the estimator used to fit the
+#'  multivariate normal proposal covariance. Either \code{"sample"} (default,
+#'  the sample covariance \eqn{\hat\Sigma_n} of \code{samples}) or
+#'  \code{"hybrid"} (the matrix geometric mean
+#'  \eqn{\hat\Sigma_n \# \hat\Sigma_{\mathrm{score}}} of the sample
+#'  covariance and the inverse empirical Fisher information matrix
+#'  computed from posterior gradients (Seyboldt et al., 2026).
+#'  \code{"hybrid"} requires posterior gradients, which are computed
+#'  automatically for \code{stanfit} and \code{CmdStanMCMC} inputs
+#'  (via \code{rstan::grad_log_prob} and \code{cmdstanr}'s
+#'  \code{grad_log_prob}, respectively), and may be supplied directly
+#'  to \code{bridge_sampler.matrix} via the \code{gradients} argument.
+#'  On other input classes \code{"hybrid"} silently falls back to
+#'  \code{"sample"}. \code{method = "warp3"} ignores
+#'  \code{proposal_fit}.
+#'@param gradients (\code{bridge_sampler.matrix} only.) Optional numeric
+#'  matrix of posterior gradients on the unconstrained scale, with one row
+#'  per row of \code{samples}. Consumed only when \code{proposal_fit =
+#'  "hybrid"} and every parameter is unbounded (i.e., \code{lb} and \code{ub}
+#'  are infinite for all parameters). Ignored otherwise.
 #'@details Bridge sampling is implemented as described in Meng and Wong (1996,
 #'  see equation 4.1) using the "optimal" bridge function. When \code{method =
 #'  "normal"}, the proposal distribution is a multivariate normal distribution
@@ -83,6 +103,32 @@
 #'  (Meng & Schilling, 2002) so that it has the same mean vector, covariance
 #'  matrix, and skew as the samples. \code{method = "warp3"} takes approximately
 #'  twice as long as \code{method = "normal"}.
+#'
+#'  When \code{proposal_fit = "hybrid"} (default \code{"sample"}), the
+#'  proposal covariance for \code{method = "normal"} is replaced by the
+#'  matrix geometric mean
+#'  \eqn{\hat\Sigma_n \# \hat\Sigma_{\mathrm{score}} =
+#'    \hat\Sigma_n^{1/2}
+#'    (\hat\Sigma_n^{-1/2} \hat\Sigma_{\mathrm{score}}
+#'     \hat\Sigma_n^{-1/2})^{1/2} \hat\Sigma_n^{1/2}}
+#'  of the sample covariance \eqn{\hat\Sigma_n} of \code{samples} and
+#'  \eqn{\hat\Sigma_{\mathrm{score}} = \hat I^{-1}}, the inverse of
+#'  the empirical centered second moment of the per-draw scores
+#'  \eqn{s_i = \nabla \log \tilde\pi(\theta_i)},
+#'  \eqn{\hat I = n^{-1} \sum_{i=1}^n
+#'   (s_i - \bar s)(s_i - \bar s)^\top}. This provides typically a
+#'  better proposal than \eqn{\hat\Sigma_n} alone when the
+#'  sample covariance is poorly conditioned. Posterior gradients are computed
+#'  automatically for \code{stanfit} and \code{CmdStanMCMC} inputs.
+#'  \code{method = "warp3"} ignores \code{proposal_fit}, since the
+#'  warp-III proposal uses an affine-transform standard-normal
+#'  proposal incompatible with a learned covariance.
+#'  Inputs to the geometric mean are nearPD-corrected by the bridge
+#'  sampler before being passed to
+#'  \code{.geometric_mean_psd()}, and exactly-zero eigenvalues are
+#'  handled via a pseudo-inverse guard. An un-recoverable input
+#'  (eigendecomposition failure or non-finite entries in the output)
+#'  errors explicitly.
 #'
 #'  Note that for the \code{matrix} method, the lower and upper bound of a
 #'  parameter cannot be a function of the bounds of another parameter.
@@ -183,9 +229,12 @@
 #'  Computational and Graphical Statistics, 11(3)}, 552-586.
 #'  \doi{10.1198/106186002457}
 #'
-#'  Micaletto, G., & Vehtari, A. (2025). Monte Carlo standard errors for bridge
-#'  sampling marginal likelihood estimation. \emph{arXiv preprint},
-#'  arXiv:2508.14487. \url{https://arxiv.org/abs/2508.14487}
+#'  Micaletto, G., & Vehtari, A. (2025). Bridge Sampling Diagnostics.
+#'  \emph{arXiv preprint}, arXiv:2508.14487. \url{https://arxiv.org/abs/2508.14487}
+#'
+#'  Seyboldt, A., Carlson, E. L., & Carpenter, B. (2026). Preconditioning
+#'  Hamiltonian Monte Carlo by minimizing Fisher Divergence. \emph{arXiv
+#'  preprint}, arXiv:2603.18845. \url{https://arxiv.org/abs/2603.18845}
 #'
 #'  Overstall, A. M., & Forster, J. J. (2010). Default Bayesian model
 #'  determination methods for generalised linear mixed models.
@@ -220,13 +269,57 @@ bridge_sampler.CmdStanMCMC <- function(
   maxiter = 1000,
   silent = FALSE,
   verbose = FALSE,
+  proposal_fit = c("sample", "hybrid"),
   ...
 ) {
+  proposal_fit <- match.arg(proposal_fit)
   draws <- samples$unconstrain_draws(format = "matrix")
   parameters <- colnames(draws)
   lb <- rep(-Inf, length(parameters))
   ub <- rep(Inf, length(parameters))
   names(lb) <- names(ub) <- parameters
+
+  # When proposal_fit = "hybrid", compute the unconstrained-scale
+  # posterior score (gradient of the log unnormalized posterior) at
+  # every draw. The caller is expected to have invoked
+  # samples$init_model_methods() so that grad_log_prob is available.
+  gradients <- NULL
+  if (identical(proposal_fit, "hybrid")) {
+    gradients <- tryCatch(
+      {
+        gm <- matrix(
+          NA_real_,
+          nrow = nrow(draws),
+          ncol = ncol(draws),
+          dimnames = list(NULL, parameters)
+        )
+        for (i in seq_len(nrow(draws))) {
+          g <- tryCatch(
+            samples$grad_log_prob(
+              unconstrained_variables = draws[i, ],
+              jacobian = TRUE
+            ),
+            error = function(e) rep(NA_real_, ncol(draws))
+          )
+          gm[i, ] <- as.numeric(g)
+        }
+        gm
+      },
+      error = function(e) {
+        warning(
+          "grad_log_prob failed (",
+          conditionMessage(e),
+          "); falling back to proposal_fit = \"sample\".",
+          call. = FALSE
+        )
+        NULL
+      }
+    )
+    if (is.null(gradients)) {
+      proposal_fit <- "sample"
+    }
+  }
+
   bridge_out <- bridge_sampler.matrix(
     samples = draws,
     ...,
@@ -240,7 +333,9 @@ bridge_sampler.CmdStanMCMC <- function(
     cores = cores,
     data = samples,
     use_neff = use_neff,
-    verbose = verbose
+    verbose = verbose,
+    gradients = gradients,
+    proposal_fit = proposal_fit
   )
 
   return(bridge_out)
@@ -258,8 +353,10 @@ bridge_sampler.stanfit <- function(
   maxiter = 1000,
   silent = FALSE,
   verbose = FALSE,
+  proposal_fit = c("sample", "hybrid"),
   ...
 ) {
+  proposal_fit <- match.arg(proposal_fit)
   # cores > 1 only for unix:
   if (!(.Platform$OS.type == "unix") & (cores != 1)) {
     warning(
@@ -328,6 +425,49 @@ bridge_sampler.stanfit <- function(
   colnames(samples_4_iter) <- paste0("trans_", parameters)
   colnames(samples_4_fit) <- paste0("trans_", parameters)
 
+  # When proposal_fit = "hybrid", compute the unconstrained-scale
+  # posterior score on the rows of samples_4_fit. samples_4_fit is on
+  # the unconstrained scale (transTypes is uniformly "unbounded"
+  # above), so rstan::grad_log_prob with adjust_transform = TRUE
+  # returns the score in the same coordinates.
+  gradients_4_fit <- NULL
+  if (identical(proposal_fit, "hybrid")) {
+    gradients_4_fit <- tryCatch(
+      {
+        gm <- matrix(
+          NA_real_,
+          nrow = nrow(samples_4_fit),
+          ncol = ncol(samples_4_fit),
+          dimnames = list(NULL, colnames(samples_4_fit))
+        )
+        for (ii in seq_len(nrow(samples_4_fit))) {
+          g <- tryCatch(
+            rstan::grad_log_prob(
+              object = stanfit_model,
+              upars = samples_4_fit[ii, ],
+              adjust_transform = TRUE
+            ),
+            error = function(e) rep(NA_real_, ncol(samples_4_fit))
+          )
+          gm[ii, ] <- as.numeric(g)
+        }
+        gm
+      },
+      error = function(e) {
+        warning(
+          "rstan::grad_log_prob failed (",
+          conditionMessage(e),
+          "); falling back to proposal_fit = \"sample\".",
+          call. = FALSE
+        )
+        NULL
+      }
+    )
+    if (is.null(gradients_4_fit)) {
+      proposal_fit <- "sample"
+    }
+  }
+
   # run bridge sampling
   if (cores == 1) {
     bridge_output <- do.call(
@@ -351,7 +491,9 @@ bridge_sampler.stanfit <- function(
         verbose = verbose,
         r0 = 0.5,
         tol1 = 1e-10,
-        tol2 = 1e-4
+        tol2 = 1e-4,
+        gradients_4_fit = gradients_4_fit,
+        proposal_fit = proposal_fit
       )
     )
   } else {
@@ -378,7 +520,9 @@ bridge_sampler.stanfit <- function(
         verbose = verbose,
         r0 = 0.5,
         tol1 = 1e-10,
-        tol2 = 1e-4
+        tol2 = 1e-4,
+        gradients_4_fit = gradients_4_fit,
+        proposal_fit = proposal_fit
       )
     )
   }
@@ -406,8 +550,10 @@ bridge_sampler.mcmc.list <- function(
   rcppFile = NULL,
   maxiter = 1000,
   silent = FALSE,
-  verbose = FALSE
+  verbose = FALSE,
+  proposal_fit = c("sample", "hybrid")
 ) {
+  proposal_fit <- match.arg(proposal_fit)
   # split samples in two parts
   nr <- nrow(samples[[1]])
   samples4fit_index <- seq_len(nr) %in% seq_len(round(nr / 2))
@@ -486,7 +632,8 @@ bridge_sampler.mcmc.list <- function(
       verbose = verbose,
       r0 = 0.5,
       tol1 = 1e-10,
-      tol2 = 1e-4
+      tol2 = 1e-4,
+      proposal_fit = proposal_fit
     )
   )
 
@@ -513,8 +660,10 @@ bridge_sampler.mcmc <- function(
   maxiter = 1000,
   param_types = rep("real", ncol(samples)),
   silent = FALSE,
-  verbose = FALSE
+  verbose = FALSE,
+  proposal_fit = c("sample", "hybrid")
 ) {
+  proposal_fit <- match.arg(proposal_fit)
   samples <- as.matrix(samples)
   bridge_output <- bridge_sampler(
     samples = samples,
@@ -534,7 +683,8 @@ bridge_sampler.mcmc <- function(
     maxiter = maxiter,
     param_types = param_types,
     silent = silent,
-    verbose = verbose
+    verbose = verbose,
+    proposal_fit = proposal_fit
   )
   return(bridge_output)
 }
@@ -559,8 +709,11 @@ bridge_sampler.matrix <- function(
   maxiter = 1000,
   param_types = rep("real", ncol(samples)),
   silent = FALSE,
-  verbose = FALSE
+  verbose = FALSE,
+  gradients = NULL,
+  proposal_fit = c("sample", "hybrid")
 ) {
+  proposal_fit <- match.arg(proposal_fit)
   # see Meng & Wong (1996), equation 4.1
 
   # Check simplex computation
@@ -589,11 +742,41 @@ bridge_sampler.matrix <- function(
   theta_t <- tmp$theta_t
   transTypes <- tmp$transTypes
 
+  # validate user-supplied gradients (proposal_fit = "hybrid" only).
+  # The chain rule for non-identity transforms is not implemented, so
+  # gradients are only consumed when every parameter is unbounded.
+  gradients_ok <- !is.null(gradients) && proposal_fit == "hybrid"
+  if (gradients_ok) {
+    if (!all(transTypes == "unbounded")) {
+      warning(
+        "proposal_fit = \"hybrid\" with bounded parameters is not ",
+        "supported (gradients require Jacobian correction); falling ",
+        "back to sample covariance.",
+        call. = FALSE
+      )
+      gradients_ok <- FALSE
+    } else if (
+      nrow(gradients) != nrow(samples) || ncol(gradients) != ncol(samples)
+    ) {
+      warning(
+        "gradients dimensions do not match samples; falling back to ",
+        "sample covariance.",
+        call. = FALSE
+      )
+      gradients_ok <- FALSE
+    }
+  }
+
   # split samples for proposal/iterative scheme
   nr <- nrow(samples)
   samples4fit_index <- seq_len(nr) %in% seq_len(round(nr / 2)) # split samples in two parts
   samples_4_fit <- theta_t[samples4fit_index, , drop = FALSE]
   samples_4_iter <- theta_t[!samples4fit_index, , drop = FALSE]
+  gradients_4_fit <- if (gradients_ok) {
+    gradients[samples4fit_index, , drop = FALSE]
+  } else {
+    NULL
+  }
 
   # compute effective sample size
   if (use_neff) {
@@ -636,7 +819,9 @@ bridge_sampler.matrix <- function(
       verbose = verbose,
       r0 = 0.5,
       tol1 = 1e-10,
-      tol2 = 1e-4
+      tol2 = 1e-4,
+      gradients_4_fit = gradients_4_fit,
+      proposal_fit = proposal_fit
     )
   )
   return(out)
@@ -655,8 +840,10 @@ bridge_sampler.stanreg <-
     maxiter = 1000,
     silent = FALSE,
     verbose = FALSE,
+    proposal_fit = c("sample", "hybrid"),
     ...
   ) {
+    proposal_fit <- match.arg(proposal_fit)
     df <- eval(samples$call$diagnostic_file)
     if (is.null(df)) {
       stop(
@@ -714,7 +901,8 @@ bridge_sampler.stanreg <-
         packages = "rstan",
         maxiter = maxiter,
         silent = silent,
-        verbose = verbose
+        verbose = verbose,
+        proposal_fit = proposal_fit
       )
     } else {
       bridge_output <- bridge_sampler(
@@ -732,7 +920,8 @@ bridge_sampler.stanreg <-
         packages = "rstan",
         maxiter = maxiter,
         silent = silent,
-        verbose = verbose
+        verbose = verbose,
+        proposal_fit = proposal_fit
       )
     }
     return(bridge_output)
@@ -757,8 +946,10 @@ bridge_sampler.rjags <- function(
   rcppFile = NULL,
   maxiter = 1000,
   silent = FALSE,
-  verbose = FALSE
+  verbose = FALSE,
+  proposal_fit = c("sample", "hybrid")
 ) {
+  proposal_fit <- match.arg(proposal_fit)
   # convert to mcmc.list
   samples <- coda::as.mcmc(samples)
   cn <- coda::varnames(samples)
@@ -782,7 +973,8 @@ bridge_sampler.rjags <- function(
     rcppFile = rcppFile,
     maxiter = maxiter,
     silent = silent,
-    verbose = verbose
+    verbose = verbose,
+    proposal_fit = proposal_fit
   )
 
   return(out)
@@ -807,8 +999,10 @@ bridge_sampler.runjags <- function(
   rcppFile = NULL,
   maxiter = 1000,
   silent = FALSE,
-  verbose = FALSE
+  verbose = FALSE,
+  proposal_fit = c("sample", "hybrid")
 ) {
+  proposal_fit <- match.arg(proposal_fit)
   # convert to mcmc.list
   samples <- coda::as.mcmc.list(samples)
 
@@ -830,7 +1024,8 @@ bridge_sampler.runjags <- function(
     rcppFile = rcppFile,
     maxiter = maxiter,
     silent = silent,
-    verbose = verbose
+    verbose = verbose,
+    proposal_fit = proposal_fit
   )
 
   return(out)
@@ -847,8 +1042,10 @@ bridge_sampler.MCMC_refClass <- function(
   maxiter = 1000,
   silent = FALSE,
   verbose = FALSE,
+  proposal_fit = c("sample", "hybrid"),
   ...
 ) {
+  proposal_fit <- match.arg(proposal_fit)
   if (!requireNamespace("nimble")) {
     stop("package nimble required")
   }
@@ -951,7 +1148,8 @@ bridge_sampler.MCMC_refClass <- function(
     packages = "nimble",
     maxiter = maxiter,
     silent = silent,
-    verbose = verbose
+    verbose = verbose,
+    proposal_fit = proposal_fit
   )
 
   return(out)

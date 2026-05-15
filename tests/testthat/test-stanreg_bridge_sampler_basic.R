@@ -5,6 +5,7 @@ test_that("stan_bridge_sampler", {
 
   testthat::skip_on_cran()
   testthat::skip_on_ci()
+  skip_if_stan_unsafe("rstanarm")
 
   if (require(rstanarm)) {
 
@@ -26,6 +27,7 @@ test_that("stan_bridge_sampler in multicore", {
   testthat::skip_on_cran()
   testthat::skip_on_ci()
   #testthat::skip_on_os("windows")
+  skip_if_stan_unsafe("rstanarm")
   if (require(rstanarm)) {
     fit_1 <- stan_glm(mpg ~ wt + qsec + am, data = mtcars,
                      chains = 2, cores = 2, iter = 5000,

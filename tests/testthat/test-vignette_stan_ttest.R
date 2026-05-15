@@ -5,6 +5,7 @@ test_that("bridge sampler yields correct results", {
 
   testthat::skip_on_cran()
   testthat::skip_on_ci()
+  skip_if_stan_unsafe()
 
   # library(bridgesampling)
   if (require(rstan) && require(BayesFactor)) {

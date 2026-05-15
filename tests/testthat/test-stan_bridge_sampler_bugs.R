@@ -64,7 +64,7 @@ test_that("subscript out of bounds error", {
   "
   testthat::skip_on_cran()
   testthat::skip_on_ci()
-  testthat::skip_if_not_installed("rstan")
+  skip_if_stan_unsafe()
   library("rstan")
   # source("tests/testthat/test_dat.txt")
   source("test_dat.txt")
@@ -82,6 +82,7 @@ test_that("bridge_sampler.stanfit multicore works for one-parameter model.", {
   skip_on_cran()
   skip_on_ci()
   skip_on_os("windows")
+  skip_if_stan_unsafe()
 
   if (require(rstan)) {
     set.seed(12345)
@@ -125,7 +126,7 @@ test_that("bridge_sampler.stanfit multicore works for one-parameter model.", {
 test_that("turtle example",{
   skip_on_cran()
   skip_on_ci()
-
+  skip_if_stan_unsafe()
 
   if (require(rstan)) {
 

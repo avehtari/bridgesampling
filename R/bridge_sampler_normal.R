@@ -25,8 +25,16 @@
   use_ess,
   r0,
   tol1,
-  tol2
+  tol2,
+  # Score-matching proposal-fit options. gradients_4_fit is an n_fit x p
+  # matrix of unconstrained-scale posterior scores at samples_4_fit;
+  # only consumed when proposal_fit = "hybrid". When supplied, the proposal
+  # covariance is the matrix geometric mean V_sample # Sigma_score per
+  # Seyboldt+Carlson+Carpenter (2026); see R/geometric_mean_psd.R.
+  gradients_4_fit = NULL,
+  proposal_fit = c("sample", "hybrid")
 ) {
+  proposal_fit <- match.arg(proposal_fit)
   if (is.null(neff)) {
     neff <- nrow(samples_4_iter)
   }
@@ -35,7 +43,53 @@
 
   # get mean & covariance matrix and generate samples from proposal
   m <- apply(samples_4_fit, 2, mean)
-  V_tmp <- cov(samples_4_fit)
+  V_sample <- cov(samples_4_fit)
+
+  if (proposal_fit == "hybrid" && is.null(gradients_4_fit)) {
+    warning(
+      "proposal_fit = \"hybrid\" requires posterior gradients, ",
+      "which are only available for stanfit and CmdStanMCMC inputs ",
+      "(or supplied directly via the `gradients` argument of the ",
+      "matrix method). Falling back to sample covariance.",
+      call. = FALSE
+    )
+  }
+  use_gradients <- proposal_fit == "hybrid" && !is.null(gradients_4_fit)
+  if (use_gradients) {
+    if (
+      nrow(gradients_4_fit) != nrow(samples_4_fit) ||
+        ncol(gradients_4_fit) != ncol(samples_4_fit)
+    ) {
+      warning(
+        "gradients_4_fit dimensions do not match samples_4_fit; ",
+        "falling back to sample covariance.",
+        call. = FALSE
+      )
+      use_gradients <- FALSE
+    }
+  }
+  if (use_gradients) {
+    sc <- .score_covariance(gradients_4_fit)
+    if (!isTRUE(sc$ok)) {
+      warning(
+        "score covariance unavailable (",
+        sc$reason,
+        "); falling back to sample covariance.",
+        call. = FALSE
+      )
+      use_gradients <- FALSE
+    }
+  }
+  if (use_gradients) {
+    # Matrix geometric mean V_sample # Sigma_score (Seyboldt+Carlson+
+    # Carpenter 2026, dense Fisher-divergence-optimal preconditioner).
+    # nearPD-correct V_sample first so .geometric_mean_psd() sees two
+    # PSD matrices; .score_covariance() already nearPD'd Sigma_score.
+    V_sample_pd <- as.matrix(nearPD(V_sample)$mat)
+    V_tmp <- .geometric_mean_psd(V_sample_pd, sc$Sigma_score)
+  } else {
+    V_tmp <- V_sample
+  }
   V <- as.matrix(nearPD(V_tmp)$mat) # make sure that V is positive-definite
 
   # sample from multivariate normal distribution and evaluate for posterior samples and generated samples

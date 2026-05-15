@@ -25,8 +25,15 @@
   use_ess,
   r0,
   tol1,
-  tol2
+  tol2,
+  # Score-matching proposal-fit options accepted for signature symmetry
+  # with `.bridge.sampler.normal()`; ignored here. The warp3 proposal
+  # uses an affine-transform standard-normal proposal that is
+  # incompatible with score-matched precision.
+  gradients_4_fit = NULL,
+  proposal_fit = c("sample", "hybrid")
 ) {
+  proposal_fit <- match.arg(proposal_fit)
   if (is.null(neff)) {
     neff <- nrow(samples_4_iter)
   }
