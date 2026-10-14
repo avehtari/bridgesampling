@@ -85,16 +85,13 @@ testthat::test_that("CmdStanMCMC bridge estimate agrees with the closed-form mar
 
   set.seed(456)
 
-  # Same model/data as above. The comparison is with the closed form, not
-  # with an rstan fit: rstan and cmdstanr model methods cannot be loaded in
-  # one R process (see helper-stan-math.R).
+  # Same model/data as above; compare with the closed form, not with rstan
   N     <- 60L
   sigma <- 1
   y     <- rnorm(N, mean = 0.25, sd = sigma)
   data_list <- list(N = N, y = y, sigma = sigma)
 
-  # target += keeps the normalizing constants, so that logml is on the
-  # scale of the closed form: y ~ N(0, sigma^2 I + 1 1').
+  # target += keeps the constants; closed form: y ~ N(0, sigma^2 I + 1 1')
   stan_code <- "
   data {
     int<lower=1> N;
